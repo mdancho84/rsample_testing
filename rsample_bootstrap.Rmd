@@ -1,0 +1,208 @@
+---
+title: "Rsample Bootstrapping with Recipes"
+author: "Matt Dancho"
+date: "December 16, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE
+    )
+```
+
+# Overview
+
+A brief document to test out the [`rsample` package](https://topepo.github.io/rsample/index.html) from Max Kuhn. This doc covers Bootstrapping with `recipes` using the workflow discussed in the [rsample application examples](https://topepo.github.io/rsample/articles/Applications/Recipes_and_rsample.html). 
+
+# Libraries
+
+```{r}
+library(tidyquant)
+library(AmesHousing)
+library(recipes)
+library(rsample)
+```
+
+
+# Boostrapping Using Recipes and Rsample
+
+According to [Wikipedia](https://en.wikipedia.org/wiki/Bootstrapping_(statistics)), 
+
+> Bootstrapping is the practice of estimating properties of an estimator (such as its variance) by measuring those properties when sampling from an approximating distribution. One standard choice for an approximating distribution is the empirical distribution function of the observed data. In the case where a set of observations can be assumed to be from an independent and identically distributed population, this can be implemented by constructing a number of resamples with replacement, of the observed dataset (and of equal size to the observed dataset).
+
+This example showcases combining preprocessing with `recipes` and bootstrapped resampleing with `rsample`. 
+
+## Data
+
+Use the Ames Housing data set. 
+
+```{r}
+ames <- make_ames()
+```
+
+Inspect the data.
+
+```{r}
+ames %>% glimpse()
+```
+
+## Preprocessing with Recipes
+
+Create a recipe object, which can be applied to any data set to preprocess. Steps:
+
+1. Create recipe - Our preprocessing plan / steps
+2. Prepare the recipe - Gets statistics
+3. Bake or Juice the prepared recipe - Processes data
+
+```{r}
+rec <- recipe(Sale_Price ~ Neighborhood + House_Style + Year_Sold + Lot_Area, 
+              data = ames) %>%
+  # Log the outcome
+  step_log(Sale_Price, base = 10) %>%
+  # Collapse rarely occurring jobs into "other"
+  step_other(Neighborhood, House_Style, threshold = 0.05) %>%
+  # Dummy variables on the qualitative predictors
+  step_dummy(all_nominal()) %>%
+  # Unskew a predictor
+  step_BoxCox(Lot_Area) %>%
+  # Normalize
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) 
+rec
+```
+Prepare the recipe using `prep()`.  
+
+```{r}
+rec_training_set <- prep(rec, training = ames, retain = TRUE, verbose = TRUE)
+```
+
+```{r}
+rec_training_set
+```
+
+Use `bake()` on newdata. Can use `juice()` as a quicker way if applying to training data. 
+
+```{r}
+ames_processed <- bake(rec_training_set, newdata = ames)
+
+ames_processed %>% glimpse()
+```
+
+## Bootstrapped Resampling With Rsample
+
+Creating bootstraps
+
+```{r}
+bt_samples <- bootstraps(ames, times = 25)
+bt_samples
+```
+
+Inspect one of the splits.
+
+```{r}
+bt_samples$splits[[1]]
+```
+
+Two data sets in one. Retrieve the training data with `analysis()` (aka in-sample).
+
+```{r}
+analysis(bt_samples$splits[[1]])
+```
+
+Retrieve the testing set with `assessment()` (aka out-of-bag sample).
+
+```{r}
+assessment(bt_samples$splits[[1]])
+```
+
+Create individual recipes for each bootstrap resample. Use a special function `prepper()` instead of `prep()`, which helps looping through resamples (split objects). 
+
+```{r}
+bt_samples <- bt_samples %>%
+    mutate(recipes = map(splits, ~ prepper(split_obj = .x, recipe = rec, retain = TRUE)))
+
+bt_samples
+```
+
+Map our modeling function. We'll just use a simple `lm()` function.
+
+```{r}
+bt_samples <- bt_samples %>%
+    mutate(fit = map(recipes, ~ lm(Sale_Price ~ ., data = juice(.x, everything()))))
+
+bt_samples
+```
+
+Create our prediction function. Takes a split, recipe and model. 
+
+```{r}
+pred_lm <- function(split_obj, rec_obj, model_obj, ...) {
+  
+    mod_data <- bake(
+        rec_obj, 
+        newdata = assessment(split_obj),
+        all_predictors(),
+        all_outcomes()
+    ) 
+  
+    ret <- mod_data %>% 
+        select(Sale_Price) %>%
+        rename(actual = Sale_Price) %>%
+        mutate(predict = predict(model_obj, newdata = mod_data %>% select(-Sale_Price)))
+    
+    return(ret)
+}
+```
+
+Test the `pred_lm()` function out. 
+
+```{r}
+pred_lm(
+    split_obj = bt_samples$splits[[1]], 
+    rec_obj   = bt_samples$recipes[[1]],
+    model_obj = bt_samples$fit[[1]]
+    )
+```
+
+Map the prediction function using `pmap()`.
+
+```{r}
+bt_samples <- bt_samples %>%
+    mutate(pred = pmap(list(splits, recipes, fit), pred_lm))
+
+bt_samples
+```
+Calculate RMSE. 
+
+```{r}
+bt_samples <- bt_samples %>%
+    mutate(rmse = map_dbl(pred, ~ sqrt(mean((.x$actual - .x$predict)^2))))
+
+bt_samples
+```
+
+Visualize the RMSE distribution bootstrapped resamples. 
+
+```{r}
+bt_samples %>%
+    ggplot(aes(rmse)) +
+    geom_histogram(aes(y = ..density..), bins = 15, fill = palette_light()[[1]], color = "white") +
+    geom_density(aes(y = ..density..), fill = "white", alpha = 0.5) + 
+    geom_vline(aes(xintercept = mean(rmse)), color = "red", size = 1) + 
+    geom_vline(aes(xintercept = mean(rmse) + 2*sd(rmse)), linetype = 2, color = "red", size = 1) +
+    geom_vline(aes(xintercept = mean(rmse) - 2*sd(rmse)), linetype = 2, color = "red", size = 1) +
+    theme_tq() +
+    labs(title = "RMSE: 95% Bootstrap Accuracy", subtitle = "25 Bootstrap Resamples")
+```
+
+Quantile for 
+
+```{r}
+bt_samples %>%
+    pull(rmse) %>%
+    quantile(probs = c(0, 0.025, 0.25, 0.5, 0.75, 0.975, 1))
+```
+

@@ -1,0 +1,174 @@
+---
+title: "Rsample Time Series Evaluation"
+author: "Matt Dancho"
+date: "December 16, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+    echo = TRUE,
+    message = FALSE,
+    warning = FALSE
+    )
+```
+
+# Overview
+
+A brief document to test out the [`rsample` package](https://topepo.github.io/rsample/index.html) from Max Kuhn. This doc covers Time Series using the workflow discussed in the [rsample application examples](https://topepo.github.io/rsample/articles/Applications/Time_Series.html). 
+
+# Libraries
+
+```{r}
+library(tidyquant)
+library(rsample)
+library(forecast)
+library(sweep)
+library(timetk)
+```
+
+
+
+
+# Time Series
+
+A great article on [time series cross validation](https://robjhyndman.com/hyndsight/tscv/) discusses the procedure for using cummulative resampling. Another option is rolling origin resampling which keeps a fixed window and progressively increases the origin. Either way are good approaches to cross validation for time series.  
+
+## Data
+
+```{r}
+beer_sales <- tq_get("S4248SM144NCEN", get = "economic.data", from = "1990-01-01", to = as.character(today()))
+
+beer_sales
+```
+
+Visualize the data. 
+
+```{r}
+beer_sales %>%
+    ggplot(aes(x = date, y = price)) +
+    geom_line(color = palette_light()[[1]], alpha = 0.5) +
+    geom_point(color = palette_light()[[1]], alpha = 1) +
+    geom_smooth(color = palette_light()[[2]], se = FALSE) +
+    theme_tq() +
+    labs(title = "Alcohol Sales: All Time")
+```
+
+## Rolling Origin Resamples 
+
+Create some rolling origin samples. Set `initial = 12 * 20` to return 20 years of samples. 
+
+```{r}
+ro_samples <- beer_sales %>%
+    rolling_origin(initial = 12 * 20, assess = 12, skip = 6, cumulative = FALSE)
+
+ro_samples
+```
+
+Visualize the sample strategy. 
+
+```{r}
+ro_samples %>%
+    mutate(data = map(splits, ~ bind_rows(analysis = analysis(.x), assessment = assessment(.x), .id = "set"))) %>%
+    select(id, data) %>%
+    unnest() %>%
+    group_by(id) %>%
+    ggplot(aes(x = date, y = price, group = id, color = set)) +
+    geom_line() +
+    facet_wrap(~ id, ncol = 3) +
+    theme_tq() +
+    scale_color_tq() +
+    labs(title = "Rolling Origin Sample Strategy")
+```
+
+
+Create the modeling function using the pipe of rsplit object:
+
+- `analysis()` - Extracts our test data in tibble form
+- `tk_ts()` - Converts to ts object
+- `auto.arima()` - produces the arima model
+
+```{r}
+fit_arima <- function(x, ...) {
+    x %>%
+        analysis() %>%
+        tk_ts(start  = .$date[[1]] %>% as.yearmon(), 
+              freq   = 12, 
+              silent = TRUE) %>%
+        auto.arima(...)
+}
+```
+
+Map our modeling function to the splits. This may take a f because of the `auto.arima()` function being applied to 9 training sets.
+
+```{r, eval = F}
+ro_samples <- ro_samples %>%
+    mutate(arima = map(splits, fit_arima))
+```
+
+```{r, echo=F, eval=F}
+saveRDS(ro_samples, file = "data/ro_samples_arima.rds")
+```
+
+```{r, echo = T}
+ro_samples <- readRDS(file = "data/ro_samples_arima.rds")
+```
+
+The arima column has been added to the data frame. 
+
+```{r}
+ro_samples
+```
+
+Inspect insample error of the resamples. 
+
+```{r}
+ro_samples %>%
+    mutate(in.error = map_dbl(arima, ~ sw_glance(.x) %>% pull(MAPE))) %>%
+    pull(in.error) %>%
+    summary()
+```
+
+Make some predictions.
+
+```{r}
+pred_arima <- function(x, model_obj, ...) {
+    
+    h <- nrow(assessment(x))
+    
+    fcast <- forecast(model_obj, h = h, ...)
+    
+    ret <- x %>%
+        assessment() %>%
+        rename(actual = price) %>%
+        mutate(pred   = fcast$mean %>% as.numeric())
+    
+    return(ret)
+}
+```
+
+Make forecasts
+
+```{r}
+ro_samples <- ro_samples %>%
+    mutate(forecast = map2(splits, arima, pred_arima))
+
+ro_samples
+```
+
+```{r}
+mape <- function(x) {
+    pct_error = (x$actual - x$pred) / x$actual * 100
+    mean(abs(pct_error))
+}
+```
+
+Out sample error.
+
+```{r}
+ro_samples %>%
+    mutate(out.error = map_dbl(forecast, mape)) %>%
+    pull(out.error) %>%
+    summary()
+```
+
