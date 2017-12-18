@@ -2,7 +2,7 @@
 title: "Rsample Time Series Evaluation"
 author: "Matt Dancho"
 date: "December 16, 2017"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -26,9 +26,6 @@ library(forecast)
 library(sweep)
 library(timetk)
 ```
-
-
-
 
 # Time Series
 
