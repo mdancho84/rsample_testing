@@ -41,7 +41,7 @@ beer_sales
 
 Visualize the data. 
 
-```{r}
+```{r, fig.height = 3.5}
 beer_sales %>%
     ggplot(aes(x = date, y = price)) +
     geom_line(color = palette_light()[[1]], alpha = 0.5) +
@@ -53,18 +53,18 @@ beer_sales %>%
 
 ## Rolling Origin Resamples 
 
-Create some rolling origin samples. Set `initial = 12 * 20` to return 20 years of samples. 
+Create some rolling origin samples. Set `initial = 12 * 20` to return 20 years of samples. I set `skip = 3` to reduce the number of resamples to 15. I set `cumulative = FALSE` to switch to rolling window resampling. 
 
 ```{r}
 ro_samples <- beer_sales %>%
-    rolling_origin(initial = 12 * 20, assess = 12, skip = 6, cumulative = FALSE)
+    rolling_origin(initial = 12 * 20, assess = 12, skip = 3, cumulative = FALSE)
 
 ro_samples
 ```
 
 Visualize the sample strategy. 
 
-```{r}
+```{r, fig.height=8}
 ro_samples %>%
     mutate(data = map(splits, ~ bind_rows(analysis = analysis(.x), assessment = assessment(.x), .id = "set"))) %>%
     select(id, data) %>%
@@ -75,7 +75,9 @@ ro_samples %>%
     facet_wrap(~ id, ncol = 3) +
     theme_tq() +
     scale_color_tq() +
-    labs(title = "Rolling Origin Sample Strategy")
+    labs(title = "Rolling Origin Sample Strategy",
+         subtitle = "Notice that the origin shifts 4 months to the right with each slice") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
 
@@ -96,7 +98,7 @@ fit_arima <- function(x, ...) {
 }
 ```
 
-Map our modeling function to the splits. This may take a f because of the `auto.arima()` function being applied to 9 training sets.
+Map our modeling function to the splits. This may take 30 seconds or so because of the `auto.arima()` function being applied to 15 training sets.
 
 ```{r, eval = F}
 ro_samples <- ro_samples %>%
@@ -107,7 +109,7 @@ ro_samples <- ro_samples %>%
 saveRDS(ro_samples, file = "data/ro_samples_arima.rds")
 ```
 
-```{r, echo = T}
+```{r, echo = F}
 ro_samples <- readRDS(file = "data/ro_samples_arima.rds")
 ```
 
@@ -117,16 +119,28 @@ The arima column has been added to the data frame.
 ro_samples
 ```
 
+## In Sample Error
+
 Inspect insample error of the resamples. 
 
 ```{r}
-ro_samples %>%
-    mutate(in.error = map_dbl(arima, ~ sw_glance(.x) %>% pull(MAPE))) %>%
-    pull(in.error) %>%
-    summary()
+ro_samples <- ro_samples %>%
+    mutate(in.error = map_dbl(arima, ~ sw_glance(.x) %>% pull(MAPE))) 
 ```
 
-Make some predictions.
+Visualize the in sample error.
+
+```{r}
+ro_samples %>%
+    ggplot(aes(in.error)) +
+    geom_histogram(fill = palette_light()[[1]]) +
+    theme_tq()
+```
+
+
+## Forecast
+
+Create a prediction function, `pred_arima()`, that returns the actual and forecasted values. It takes a split object and and model object creating the prediction (forecast) using the `forecast()` function. 
 
 ```{r}
 pred_arima <- function(x, model_obj, ...) {
@@ -144,7 +158,14 @@ pred_arima <- function(x, model_obj, ...) {
 }
 ```
 
-Make forecasts
+Test the prediction function on one of the resamples. 
+
+```{r}
+pred_arima(x = ro_samples$splits[[1]], model_obj = ro_samples$arima[[1]])
+```
+
+
+Make forecasts for each of the resamples using `map2()`. 
 
 ```{r}
 ro_samples <- ro_samples %>%
@@ -153,6 +174,8 @@ ro_samples <- ro_samples %>%
 ro_samples
 ```
 
+Make a function, `mape()`, to calculate the mean absolute percentage error. 
+
 ```{r}
 mape <- function(x) {
     pct_error = (x$actual - x$pred) / x$actual * 100
@@ -160,12 +183,31 @@ mape <- function(x) {
 }
 ```
 
-Out sample error.
+## Out Sample Error
+
+Out sample error. 
+
+```{r}
+ro_samples <- ro_samples %>%
+    mutate(out.error = map_dbl(forecast, mape)) 
+
+ro_samples
+```
+
+Visualize the distribution of in sample and out of sample errors.
 
 ```{r}
 ro_samples %>%
-    mutate(out.error = map_dbl(forecast, mape)) %>%
-    pull(out.error) %>%
-    summary()
+    select(in.error, out.error) %>%
+    gather() %>%
+    ggplot(aes(x = statistic, fill = model)) +
+    geom_histogram(aes(y = ..density..), alpha = 0.8) +
+    geom_density(aes(y = ..density..), alpha = 0.5) +
+    theme_tq() +
+    scale_fill_tq() +
+    labs(title = "Examining Error: In Sample vs Out Sample")
+    
 ```
+
+
 
